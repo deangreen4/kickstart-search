@@ -1,0 +1,9 @@
+# index data (rebuild with: python3 kickstart_search.py crawl)
+kickstart.db
+kickstart.db-wal
+kickstart.db-shm
+*.db
+
+__pycache__/
+*.pyc
+.DS_Store

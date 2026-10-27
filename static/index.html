@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kick Start Search</title>
+<style>
+  :root {
+    --bg: #0e1013; --card: #16191f; --card2: #1b1f27; --line: #262b35;
+    --text: #d7dae0; --dim: #8a909c; --accent: #ff6b6b; --mark: #b45309;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding-bottom: 90px;
+  }
+  header { padding: 22px 20px 6px; max-width: 960px; margin: 0 auto; }
+  h1 { margin: 0; font-size: 22px; letter-spacing: .3px; }
+  h1 span { color: var(--accent); }
+  .stats { color: var(--dim); font-size: 12.5px; margin-top: 3px; }
+  .searchbar {
+    position: sticky; top: 0; z-index: 5; background: linear-gradient(var(--bg) 82%, transparent);
+    padding: 12px 20px 14px; max-width: 960px; margin: 0 auto;
+  }
+  #q {
+    width: 100%; padding: 12px 16px; font-size: 16px; color: var(--text);
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px; outline: none;
+  }
+  #q:focus { border-color: var(--accent); }
+  .hint { color: var(--dim); font-size: 12px; margin: 6px 2px 0; }
+  main { max-width: 960px; margin: 10px auto 0; padding: 0 20px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    margin: 10px 0; overflow: hidden;
+  }
+  .cardhead {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 14px; background: var(--card2); border-bottom: 1px solid var(--line);
+  }
+  .setname { color: var(--accent); text-decoration: none; font-weight: 600; }
+  .setname:hover { text-decoration: underline; }
+  .meta { color: var(--dim); font-size: 12.5px; }
+  .spacer { flex: 1; }
+  button {
+    background: #222732; color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 5px 10px; font-size: 12.5px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); color: #fff; }
+  ol.tracks { list-style: none; margin: 0; padding: 6px 0; }
+  ol.tracks li { display: flex; gap: 10px; padding: 4px 14px; align-items: baseline; }
+  ol.tracks li:hover { background: #1a1e26; }
+  .pos { color: var(--dim); font-variant-numeric: tabular-nums; min-width: 26px; text-align: right; }
+  .artist { font-weight: 600; white-space: nowrap; }
+  .sep { color: var(--dim); }
+  .tit { color: var(--text); }
+  .remix { color: var(--dim); font-style: normal; font-size: 13px; }
+  mark { background: var(--mark); color: #fff; border-radius: 3px; padding: 0 1px; }
+  .matchbadge { font-size: 11px; color: #ffd27d; border: 1px solid #5b4a1e; border-radius: 6px; padding: 0 6px; }
+  .browse { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 0; }
+  .browse button { font-variant-numeric: tabular-nums; }
+  .empty { color: var(--dim); padding: 30px 0; text-align: center; }
+  .player {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
+    display: flex; align-items: center; gap: 12px;
+    background: #10131a; border-top: 1px solid var(--line); padding: 10px 16px;
+  }
+  .player.hidden { display: none; }
+  #pp { width: 38px; height: 38px; border-radius: 50%; font-size: 15px; }
+  .now { flex: 1; min-width: 0; }
+  #nowtitle { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13.5px; }
+  .now small { color: var(--dim); }
+  #nowlink { color: var(--accent); text-decoration: none; font-size: 13px; white-space: nowrap; }
+  #nowlink:hover { text-decoration: underline; }
+  #close { border: none; background: none; color: var(--dim); font-size: 15px; }
+  #close:hover { color: #fff; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Kick Start <span>search</span></h1>
+  <div class="stats" id="stats">loading index info&hellip;</div>
+</header>
+
+<div class="searchbar">
+  <input id="q" type="search" autofocus autocomplete="off" spellcheck="false"
+         placeholder='Search artist, track, remix &mdash; e.g. sean tyas, "lost emotions", 244'>
+  <div class="hint">prefix matching on every word &middot; use &ldquo;quotes&rdquo; for exact phrases &middot; type a set number to open it &middot; press / to focus</div>
+</div>
+
+<main id="results"></main>
+
+<div id="player" class="player hidden">
+  <button id="pp" title="play / pause">&#9654;</button>
+  <div class="now">
+    <span id="nowtitle"></span>
+    <small id="nowsub"></small>
+  </div>
+  <a id="nowlink" target="_blank" rel="noopener">open mp3 &#8599;</a>
+  <button id="close" title="close player">&#10005;</button>
+</div>
+<audio id="audio"></audio>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const resultsEl = $("#results"), qEl = $("#q");
+const audio = $("#audio"), playerEl = $("#player");
+
+let current = null;      // {num, url, title}
+let browseCache = null;  // all sets for browse mode
+let abortCtl = null;
+let debounceTimer = null;
+let lastTokens = [];
+
+function esc(s) {
+  return (s || "").replace(/[&<>"']/g, c =>
+    ({ "&": "&" + "amp;", "<": "&" + "lt;", ">": "&" + "gt;", '"': "&" + "quot;", "'": "&#39;" }[c]));
+}
+function highlight(text, tokens) {
+  if (!text || !tokens || !tokens.length) return esc(text);
+  const rx = new RegExp("(" + tokens.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|") + ")", "gi");
+  return esc(text).replace(rx, "<mark>$1</mark>");
+}
+function pad(n) { return String(n).padStart(2, "0"); }
+
+/* ---------- rendering ---------- */
+
+function trackLi(t, tokens) {
+  const remix = t.remix ? ` <em class="remix">(${esc(t.remix)})</em>` : "";
+  return `<li><span class="pos">${pad(t.position)}</span>` +
+    `<span class="artist">${highlight(t.artist, tokens)}</span>` +
+    `<span class="sep">&mdash;</span>` +
+    `<span class="tit">${highlight(t.title, tokens)}${remix}</span></li>`;
+}
+
+function setCard(s, matched, tokens, expanded) {
+  const hits = matched ? matched.length : (s.hits || 0);
+  const shown = (s.tracks || matched || []);
+  const isDirect = !!s.direct;
+  const head =
+    `<div class="cardhead">
+       <a class="setname" href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title)}</a>
+       <span class="meta">${isDirect ? `${s.track_count} tracks` :
+          `${hits} of ${s.track_count} tracks matched`}</span>
+       ${!isDirect ? `<span class="matchbadge">match</span>` : ""}
+       <span class="spacer"></span>
+       ${s.mp3_url ? `<button data-act="play" data-num="${s.number}">&#9654; play set</button>` : ""}
+       <button data-act="copy" data-num="${s.number}">copy list</button>
+       <button data-act="more" data-num="${s.number}">${expanded ? "hide full list" : "full tracklist"}</button>
+     </div>`;
+  const body = `<ol class="tracks" data-body="${s.number}">${
+    shown.length
+      ? shown.map(t => trackLi(t, tokens)).join("")
+      : `<li><span class="meta">no parsed tracks for this set</span></li>`
+  }</ol>`;
+  return `<section class="card" id="set-${s.number}" data-num="${s.number}"
+            data-url="${esc(s.url)}" data-mp3="${esc(s.mp3_url || "")}"
+            data-title="${esc(s.title)}" data-count="${s.track_count}">${head}${body}</section>`;
+}
+
+function renderSearch(data) {
+  const tokens = data.tokens || [];
+  const bySet = new Map();
+  for (const t of data.tracks) {
+    if (!bySet.has(t.set_number)) bySet.set(t.set_number, []);
+    bySet.get(t.set_number).push(t);
+  }
+  let html = "";
+  if (data.set_direct) {
+    const d = data.set_direct;
+    html += setCard(
+      { number: d.number, title: d.title, url: d.url, mp3_url: d.mp3_url, track_count: d.track_count, direct: true },
+      d.tracks, tokens, true);
+  }
+  if (data.sets.length) {
+    for (const s of data.sets) {
+      const matched = bySet.get(s.number) || [];
+      html += setCard(s, matched, tokens, false);
+    }
+    html += `<div class="empty">${data.total_hits} track hits in ${data.set_count} sets &middot; ${data.elapsed_ms} ms</div>`;
+  }
+  if (!html) {
+    html = `<div class="empty">No matches for &ldquo;${esc(data.q)}&rdquo;.<br>
+      <small>Try fewer words, or a set number like <b>244</b>.</small></div>`;
+  }
+  resultsEl.innerHTML = html;
+}
+
+async function renderBrowse() {
+  if (!browseCache) {
+    const r = await fetch("/api/sets");
+    browseCache = (await r.json()).sets;
+  }
+  resultsEl.innerHTML =
+    `<div class="empty" style="padding:14px 0">Browse all sets</div>
+     <div class="browse">${browseCache.map(s =>
+       `<button data-browse="${s.number}" title="${esc(s.title)} &mdash; ${s.track_count} tracks">${String(s.number).padStart(3, "0")}</button>`
+     ).join("")}</div>`;
+}
+
+/* ---------- data ---------- */
+
+async function doSearch(q) {
+  if (abortCtl) abortCtl.abort();
+  abortCtl = new AbortController();
+  try {
+    const r = await fetch("/api/search?q=" + encodeURIComponent(q), { signal: abortCtl.signal });
+    const data = await r.json();
+    lastTokens = data.tokens || [];
+    renderSearch(data);
+  } catch (e) {
+    if (e.name !== "AbortError") {
+      resultsEl.innerHTML = `<div class="empty">Search failed: ${esc(String(e))}</div>`;
+    }
+  }
+}
+
+function onQueryChange() {
+  const q = qEl.value.trim();
+  clearTimeout(debounceTimer);
+  if (!q) {
+    if (abortCtl) abortCtl.abort();
+    renderBrowse();
+    return;
+  }
+  debounceTimer = setTimeout(() => doSearch(q), 180);
+}
+
+/* ---------- card actions (event delegation) ---------- */
+
+async function fullTracks(num) {
+  const r = await fetch("/api/set/" + num);
+  if (!r.ok) return null;
+  return (await r.json()).tracks;
+}
+
+resultsEl.addEventListener("click", async ev => {
+  const btn = ev.target.closest("button");
+  if (btn && btn.dataset.act === "play") {
+    const card = btn.closest(".card");
+    playSet(+card.dataset.num, card.dataset.mp3, card.dataset.title, card.dataset.count);
+    return;
+  }
+  if (btn && btn.dataset.act === "more") {
+    const card = btn.closest(".card");
+    const num = card.dataset.num;
+    const body = card.querySelector(`ol[data-body="${num}"]`);
+    const expanded = body.dataset.full === "1";
+    if (expanded) {
+      // restore to matched-only view by re-running current search
+      onQueryChange();
+    } else {
+      body.dataset.full = "1";
+      btn.textContent = "hide full list";
+      const tracks = await fullTracks(num);
+      if (tracks) {
+        body.innerHTML = tracks.map(t => trackLi(t, qEl.value.trim() ? (lastTokens || []) : [])).join("");
+      }
+    }
+    return;
+  }
+  if (btn && btn.dataset.act === "copy") {
+    const num = btn.dataset.num;
+    const tracks = await fullTracks(num);
+    if (tracks) {
+      const text = tracks.map(t =>
+        `${pad(t.position)}. ${[t.artist, t.title].filter(Boolean).join(" - ")}${t.remix ? " (" + t.remix + ")" : ""}`
+      ).join("\n");
+      try {
+        await navigator.clipboard.writeText(text);
+        btn.textContent = "copied!";
+        setTimeout(() => (btn.textContent = "copy list"), 1200);
+      } catch { btn.textContent = "copy failed"; }
+    }
+    return;
+  }
+  const b = ev.target.closest("button[data-browse]");
+  if (b) {
+    qEl.value = b.dataset.browse;
+    doSearch(qEl.value);
+    qEl.focus();
+  }
+});
+
+/* ---------- player ---------- */
+
+function playSet(num, url, title, count) {
+  if (current && current.num === num && audio.src) {
+    if (audio.paused) audio.play(); else audio.pause();
+    return;
+  }
+  current = { num, url, title };
+  audio.src = url;
+  audio.play();
+  playerEl.classList.remove("hidden");
+  $("#nowtitle").textContent = title;
+  $("#nowsub").textContent = `streaming from sets.dfx.at (${count} tracks)`;
+  $("#nowlink").href = url;
+}
+$("#pp").addEventListener("click", () => {
+  if (!audio.src) return;
+  if (audio.paused) audio.play(); else audio.pause();
+});
+audio.addEventListener("play", () => ($("#pp").innerHTML = "&#10074;&#10074;"));
+audio.addEventListener("pause", () => ($("#pp").innerHTML = "&#9654;"));
+$("#close").addEventListener("click", () => {
+  audio.pause(); audio.removeAttribute("src"); audio.load();
+  playerEl.classList.add("hidden"); current = null;
+});
+
+/* ---------- boot ---------- */
+
+qEl.addEventListener("input", onQueryChange);
+qEl.addEventListener("keydown", e => {
+  if (e.key === "Enter") { clearTimeout(debounceTimer); doSearch(qEl.value.trim()); }
+  if (e.key === "Escape") { qEl.value = ""; onQueryChange(); }
+});
+document.addEventListener("keydown", e => {
+  if (e.key === "/" && document.activeElement !== qEl) { e.preventDefault(); qEl.focus(); qEl.select(); }
+});
+
+fetch("/api/stats").then(r => r.json()).then(s => {
+  const d = s.crawled_at ? new Date(s.crawled_at).toLocaleString() : "never";
+  $("#stats").innerHTML =
+    `${s.sets} sets &middot; ${s.tracks.toLocaleString()} tracks &middot; indexed ${esc(d)}` +
+    ` &middot; <a style="color:var(--dim)" href="#" onclick="return false" title="run: python3 kickstart_search.py crawl">re-crawl to update</a>`;
+});
+onQueryChange();
+</script>
+</body>
+</html>
