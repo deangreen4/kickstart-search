@@ -263,7 +263,6 @@ def create_schema(con):
             txt_name    TEXT,
             listing_lm  TEXT,
             listing_sha TEXT,
-            listing_sha TEXT,
             txt_etag    TEXT,
             txt_lm      TEXT,
             raw_text    TEXT,
@@ -294,7 +293,12 @@ def create_schema(con):
     # migration for indexes created before listing_sha existed
     cols = {r[1] for r in con.execute("PRAGMA table_info(sets)")}
     if "listing_sha" not in cols:
-        con.execute("ALTER TABLE sets ADD COLUMN listing_sha TEXT")
+        try:
+            con.execute("ALTER TABLE sets ADD COLUMN listing_sha TEXT")
+        except sqlite3.OperationalError as e:
+            # another process may have added it concurrently — that's fine
+            if "duplicate column" not in str(e).lower():
+                raise
 
 
 def rebuild_fts(con):
