@@ -25,6 +25,7 @@ import socket
 import sqlite3
 import ssl
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -241,10 +242,11 @@ def pick_txt(entries, num):
 # --------------------------------------------------------------------------- #
 
 def connect_db(path):
-    con = sqlite3.connect(str(path), check_same_thread=False)
+    con = sqlite3.connect(str(path), check_same_thread=False, timeout=10)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
+    con.execute("PRAGMA busy_timeout=10000")
     return con
 
 
@@ -444,16 +446,63 @@ def crawl_set(num, href, base, prev, delay, force=False):
     }
 
 
-def cmd_crawl(args):
-    db_path = Path(args.db)
-    if args.reset and db_path.exists():
+CRAWL_STATE = {
+    "running": False,
+    "phase": "idle",        # idle | listing | crawling | finalizing | done | error
+    "done": 0,
+    "total": 0,
+    "fetched": 0,
+    "unchanged": 0,
+    "counts": {},
+    "started": None,
+    "finished": None,
+    "error": None,
+}
+CRAWL_LOCK = threading.Lock()
+
+
+def run_crawl(db_path, base=BASE_URL, limit=None, workers=6, delay=0.05,
+              force=False, reset=False, log=None):
+    """Crawl + index the archive. Thread-safe against itself via CRAWL_LOCK;
+
+    `log(msg)` receives human-readable progress lines (defaults to print).
+    Returns a summary dict.
+    """
+    log = log or print
+    db_path = Path(db_path)
+    with CRAWL_LOCK:
+        if CRAWL_STATE["running"]:
+            raise RuntimeError("a crawl is already running")
+        CRAWL_STATE.update({
+            "running": True, "phase": "listing", "done": 0, "total": 0,
+            "fetched": 0, "unchanged": 0, "counts": {}, "started": _now(),
+            "finished": None, "error": None,
+        })
+        try:
+            summary = _crawl_locked(db_path, base, limit, workers, delay, force, reset, log)
+        except Exception as e:
+            CRAWL_STATE.update({"running": False, "phase": "error", "error": str(e)[:300],
+                                "finished": _now()})
+            raise
+        CRAWL_STATE.update({"running": False, "phase": "done", "finished": _now(),
+                            "counts": summary["counts"]})
+        return summary
+
+
+def _now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _crawl_locked(db_path, base, limit, workers, delay, force, reset, log):
+    if reset and db_path.exists():
         db_path.unlink()
     con = connect_db(db_path)
     create_schema(con)
 
-    print(f"Index: {db_path}", flush=True)
-    print(f"Fetching directory index: {args.base}", flush=True)
-    status, _, body = fetch(args.base)
+    CRAWL_STATE["phase"] = "listing"
+    log(f"Index: {db_path}", flush=True)
+    log(f"Fetching directory index: {base}", flush=True)
+    status, _, body = fetch(base)
     entries = parse_listing(body)
     folders = []
     for href, name in entries:
@@ -461,24 +510,25 @@ def cmd_crawl(args):
         if m and href.endswith("/"):
             folders.append((int(m.group(1)), href))
     folders.sort()
-    print(f"Found {len(folders)} Kick Start folders", flush=True)
-    if args.limit:
-        folders = folders[: args.limit]
-        print(f"Limited to first {args.limit} folders (--limit)", flush=True)
+    log(f"Found {len(folders)} Kick Start folders", flush=True)
+    if limit:
+        folders = folders[:limit]
+        log(f"Limited to first {limit} folders (--limit)", flush=True)
 
     prev_by_num = {}
     for row in con.execute("SELECT number, listing_lm, listing_sha, txt_etag, txt_lm, raw_text, status, track_count FROM sets"):
         prev_by_num[row["number"]] = dict(row)
 
+    CRAWL_STATE.update({"phase": "crawling", "total": len(folders)})
     t0 = time.time()
     done = skipped = 0
     counts = {"ok": 0, "empty": 0, "no_txt": 0, "missing": 0, "error": 0}
 
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(
-                crawl_set, num, href, args.base,
-                prev_by_num.get(num), args.delay, args.force,
+                crawl_set, num, href, base,
+                prev_by_num.get(num), delay, force,
             ): num
             for num, href in folders
         }
@@ -487,7 +537,8 @@ def cmd_crawl(args):
             try:
                 res = fut.result()
             except Exception as e:  # defensive: workers should not raise
-                print(f"  ! set {num:03d}: unexpected error {e}", flush=True)
+                log(f"  ! set {num:03d}: unexpected error {e}", flush=True)
+                counts["error"] += 1
                 continue
             if res.get("skip"):
                 skipped += 1
@@ -495,14 +546,19 @@ def cmd_crawl(args):
                 save_set(con, res)
                 counts[res["status"]] = counts.get(res["status"], 0) + 1
             done += 1
+            CRAWL_STATE.update({
+                "done": done, "fetched": done - skipped, "unchanged": skipped,
+                "counts": dict(counts),
+            })
             if done % 25 == 0 or done == len(folders):
-                print(
+                log(
                     f"  {done}/{len(folders)} folders "
                     f"({done - skipped} fetched, {skipped} unchanged)",
                     flush=True,
                 )
 
-    print("Rebuilding full-text index...", flush=True)
+    CRAWL_STATE["phase"] = "finalizing"
+    log("Rebuilding full-text index...", flush=True)
     with con:
         rebuild_fts(con)
     con.execute("PRAGMA optimize")
@@ -510,12 +566,22 @@ def cmd_crawl(args):
 
     n_sets = con.execute("SELECT COUNT(*) FROM sets").fetchone()[0]
     n_tracks = con.execute("SELECT COUNT(*) FROM tracks").fetchone()[0]
-    print(
-        f"Done in {time.time() - t0:.0f}s: {n_sets} sets, {n_tracks} tracks indexed "
+    summary = {
+        "sets": n_sets, "tracks": n_tracks, "seconds": round(time.time() - t0, 1),
+        "counts": counts, "unchanged": skipped,
+    }
+    log(
+        f"Done in {summary['seconds']:.0f}s: {n_sets} sets, {n_tracks} tracks indexed "
         f"(this run: {counts['ok']} ok, {counts['no_txt']} without tracklist, "
         f"{counts['missing']} missing, {counts['error']} errors, {skipped} unchanged)",
         flush=True,
     )
+    return summary
+
+
+def cmd_crawl(args):
+    run_crawl(args.db, base=args.base, limit=args.limit, workers=args.workers,
+              delay=args.delay, force=args.force, reset=args.reset)
 
 
 # --------------------------------------------------------------------------- #
@@ -665,6 +731,51 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def do_POST(self):
+        try:
+            self._route_post()
+        except BrokenPipeError:
+            pass
+        except Exception as e:
+            try:
+                self.send_json({"error": f"{type(e).__name__}: {e}"}, 500)
+            except Exception:
+                pass
+
+    def _route_post(self):
+        parsed = urlparse(self.path)
+        # drain any request body to keep the keep-alive connection in sync
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        if parsed.path == "/api/recrawl":
+            with CRAWL_LOCK:
+                if CRAWL_STATE["running"]:
+                    self.send_json({
+                        "started": False, "running": True,
+                        "phase": CRAWL_STATE["phase"], "done": CRAWL_STATE["done"],
+                        "total": CRAWL_STATE["total"],
+                    }, 409)
+                    return
+                CRAWL_STATE.update({
+                    "running": True, "phase": "queued", "done": 0, "total": 0,
+                    "fetched": 0, "unchanged": 0, "counts": {}, "started": _now(),
+                    "finished": None, "error": None,
+                })
+            threading.Thread(target=self._crawl_thread, daemon=True).start()
+            self.send_json({"started": True, "running": True, "phase": "queued"})
+        else:
+            self.send_json({"error": "not found"}, 404)
+
+    def _crawl_thread(self):
+        try:
+            _crawl_locked(Path(self.db_path), BASE_URL, None, 6, 0.05, False, False, log=print)
+        except Exception as e:
+            CRAWL_STATE.update({"running": False, "phase": "error",
+                                "error": str(e)[:300], "finished": _now()})
+        else:
+            CRAWL_STATE.update({"running": False, "phase": "done", "finished": _now()})
+
     def _route(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -718,6 +829,8 @@ class Handler(BaseHTTPRequestHandler):
                 "SELECT number, title, url, mp3_url, track_count, status FROM sets ORDER BY number"
             ).fetchall()
             self.send_json({"sets": [dict(r) for r in rows]})
+        elif path == "/api/crawl/status":
+            self.send_json(dict(CRAWL_STATE))
         elif path == "/api/stats":
             one = self.db.execute(
                 "SELECT COUNT(*) AS n, MAX(crawled_at) AS crawled FROM sets"

@@ -34,6 +34,10 @@ The UI groups results by set, shows the matched track positions, can expand
 the full tracklist of any set, copy it to the clipboard, and stream the MP3
 directly from the origin server (no MP3s are ever downloaded by the crawler).
 
+The **re-crawl to update** link in the header re-indexes the archive in the
+background (via the running server) with a live progress bar — no need to
+touch the terminal for routine updates.
+
 ## Commands
 
 | command | purpose |
@@ -48,10 +52,12 @@ Useful crawl options: `--reset` (rebuild from scratch), `--limit N` (testing),
 ## HTTP API
 
 ```
-GET /api/search?q=sean+tyas&limit=400   -> ranked tracks + per-set hit counts
-GET /api/set/244                        -> full tracklist of one set
-GET /api/sets                           -> all indexed sets
-GET /api/stats                          -> index statistics
+GET  /api/search?q=sean+tyas&limit=400   -> ranked tracks + per-set hit counts
+GET  /api/set/244                        -> full tracklist of one set
+GET  /api/sets                           -> all indexed sets
+GET  /api/stats                          -> index statistics
+POST /api/recrawl                        -> start a background re-crawl (409 if one is running)
+GET  /api/crawl/status                   -> live crawl progress (phase, done/total, unchanged)
 ```
 
 ## How it works

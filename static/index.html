@@ -20,6 +20,14 @@
   h1 { margin: 0; font-size: 22px; letter-spacing: .3px; }
   h1 span { color: var(--accent); }
   .stats { color: var(--dim); font-size: 12.5px; margin-top: 3px; }
+  .stats a { color: var(--dim); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+  .stats a:hover { color: var(--accent); }
+  body.crawling .stats a { pointer-events: none; opacity: .45; }
+  .crawlprog { display: flex; align-items: center; gap: 10px; margin-top: 8px; color: var(--dim); font-size: 12.5px; }
+  .crawlprog.hidden { display: none; }
+  .crawlprog .bar { width: 240px; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; flex: none; }
+  .crawlprog .bar i { display: block; height: 100%; width: 0%; background: var(--accent); transition: width .4s; }
+  .crawlprog .pct { min-width: 34px; text-align: right; font-variant-numeric: tabular-nums; }
   .searchbar {
     position: sticky; top: 0; z-index: 5; background: linear-gradient(var(--bg) 82%, transparent);
     padding: 12px 20px 14px; max-width: 960px; margin: 0 auto;
@@ -81,6 +89,11 @@
 <header>
   <h1>Kick Start <span>search</span></h1>
   <div class="stats" id="stats">loading index info&hellip;</div>
+  <div id="crawlprog" class="crawlprog hidden">
+    <div class="bar"><i id="crawlfill"></i></div>
+    <span class="pct" id="crawlpct"></span>
+    <span id="crawltxt"></span>
+  </div>
 </header>
 
 <div class="searchbar">
@@ -310,6 +323,92 @@ $("#close").addEventListener("click", () => {
   playerEl.classList.add("hidden"); current = null;
 });
 
+/* ---------- re-crawl with progress ---------- */
+
+function refreshStats() {
+  return fetch("/api/stats").then(r => r.json()).then(s => {
+    const d = s.crawled_at ? new Date(s.crawled_at).toLocaleString() : "never";
+    $("#stats").innerHTML =
+      `${s.sets} sets &middot; ${s.tracks.toLocaleString()} tracks &middot; indexed ${esc(d)}` +
+      ` &middot; <a href="#" id="recrawl" title="re-index the archive in the background">re-crawl to update</a>`;
+  }).catch(() => {});
+}
+
+function showCrawlMsg(msg, isError) {
+  const el = $("#stats");
+  el.innerHTML = (isError ? "&#9888; " : "&#10004; ") + esc(msg);
+  setTimeout(refreshStats, 6000);
+}
+
+async function startRecrawl() {
+  let j;
+  try {
+    const r = await fetch("/api/recrawl", { method: "POST" });
+    j = await r.json();
+  } catch (e) {
+    showCrawlMsg("re-crawl failed to start: " + e, true);
+    return;
+  }
+  if (j.started === false && !j.running) {
+    showCrawlMsg("re-crawl refused: " + (j.reason || "unknown"), true);
+    return;
+  }
+  pollCrawl();
+}
+
+let crawlTimer = null;
+function pollCrawl() {
+  if (crawlTimer) return;
+  const tick = async () => {
+    let s;
+    try {
+      s = await (await fetch("/api/crawl/status")).json();
+    } catch (e) {
+      crawlTimer = setTimeout(tick, 1500);
+      return;
+    }
+    if (s.running) {
+      document.body.classList.add("crawling");
+      $("#crawlprog").classList.remove("hidden");
+      const pct = s.total ? Math.round(100 * s.done / s.total) : 0;
+      $("#crawlfill").style.width = pct + "%";
+      $("#crawlpct").textContent = s.total ? pct + "%" : "";
+      $("#crawltxt").textContent =
+        s.phase === "listing" ? "fetching directory index\u2026" :
+        s.phase === "finalizing" ? "rebuilding search index\u2026" :
+        s.phase === "queued" ? "starting crawler\u2026" :
+        `crawling: ${s.done}/${s.total} sets (${s.unchanged} unchanged)`;
+      crawlTimer = setTimeout(tick, 600);
+      return;
+    }
+    // finished (or nothing running)
+    crawlTimer = null;
+    document.body.classList.remove("crawling");
+    const wasVisible = !$("#crawlprog").classList.contains("hidden");
+    $("#crawlprog").classList.add("hidden");
+    $("#crawlfill").style.width = "0%";
+    $("#crawlpct").textContent = "";
+    if (wasVisible) {
+      if (s.phase === "error") {
+        showCrawlMsg("re-crawl failed: " + (s.error || "unknown error"), true);
+      } else {
+        const c = s.counts || {};
+        const fresh = (c.ok || 0) + (c.empty || 0) + (c.no_txt || 0) + (c.missing || 0) + (c.error || 0);
+        showCrawlMsg(`re-crawl finished: ${fresh} sets checked, ${s.unchanged} unchanged`);
+      }
+      onQueryChange();
+    }
+  };
+  tick();
+}
+
+document.addEventListener("click", e => {
+  if (e.target.closest("#recrawl")) {
+    e.preventDefault();
+    if (!document.body.classList.contains("crawling")) startRecrawl();
+  }
+});
+
 /* ---------- boot ---------- */
 
 qEl.addEventListener("input", onQueryChange);
@@ -321,12 +420,8 @@ document.addEventListener("keydown", e => {
   if (e.key === "/" && document.activeElement !== qEl) { e.preventDefault(); qEl.focus(); qEl.select(); }
 });
 
-fetch("/api/stats").then(r => r.json()).then(s => {
-  const d = s.crawled_at ? new Date(s.crawled_at).toLocaleString() : "never";
-  $("#stats").innerHTML =
-    `${s.sets} sets &middot; ${s.tracks.toLocaleString()} tracks &middot; indexed ${esc(d)}` +
-    ` &middot; <a style="color:var(--dim)" href="#" onclick="return false" title="run: python3 kickstart_search.py crawl">re-crawl to update</a>`;
-});
+refreshStats();
+pollCrawl();   // picks up a crawl already running (e.g. from another tab)
 onQueryChange();
 </script>
 </body>
