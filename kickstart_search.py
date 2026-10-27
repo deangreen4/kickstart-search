@@ -282,6 +282,10 @@ def create_schema(con):
             remix      TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_tracks_set ON tracks(set_number, position);
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
         CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(
             artist, title, remix, set_title
         );
@@ -493,90 +497,113 @@ def _now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _save_crawl_meta(con, started, finished, payload):
+    """Record when the archive was last checked, regardless of what changed."""
+    with con:
+        con.executemany(
+            "INSERT INTO meta(key, value) VALUES(?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [
+                ("last_crawl_started", started),
+                ("last_crawl_finished", finished),
+                ("last_crawl_summary", json.dumps(payload, ensure_ascii=False)),
+            ],
+        )
+
+
 def _crawl_locked(db_path, base, limit, workers, delay, force, reset, log):
     if reset and db_path.exists():
         db_path.unlink()
     con = connect_db(db_path)
     create_schema(con)
+    started = _now()
 
-    CRAWL_STATE["phase"] = "listing"
-    log(f"Index: {db_path}", flush=True)
-    log(f"Fetching directory index: {base}", flush=True)
-    status, _, body = fetch(base)
-    entries = parse_listing(body)
-    folders = []
-    for href, name in entries:
-        m = SET_DIR_RE.match(name[:-1] if name.endswith("/") else name)
-        if m and href.endswith("/"):
-            folders.append((int(m.group(1)), href))
-    folders.sort()
-    log(f"Found {len(folders)} Kick Start folders", flush=True)
-    if limit:
-        folders = folders[:limit]
-        log(f"Limited to first {limit} folders (--limit)", flush=True)
+    try:
+        CRAWL_STATE["phase"] = "listing"
+        log(f"Index: {db_path}", flush=True)
+        log(f"Fetching directory index: {base}", flush=True)
+        status, _, body = fetch(base)
+        entries = parse_listing(body)
+        folders = []
+        for href, name in entries:
+            m = SET_DIR_RE.match(name[:-1] if name.endswith("/") else name)
+            if m and href.endswith("/"):
+                folders.append((int(m.group(1)), href))
+        folders.sort()
+        log(f"Found {len(folders)} Kick Start folders", flush=True)
+        if limit:
+            folders = folders[:limit]
+            log(f"Limited to first {limit} folders (--limit)", flush=True)
 
-    prev_by_num = {}
-    for row in con.execute("SELECT number, listing_lm, listing_sha, txt_etag, txt_lm, raw_text, status, track_count FROM sets"):
-        prev_by_num[row["number"]] = dict(row)
+        prev_by_num = {}
+        for row in con.execute("SELECT number, listing_lm, listing_sha, txt_etag, txt_lm, raw_text, status, track_count FROM sets"):
+            prev_by_num[row["number"]] = dict(row)
 
-    CRAWL_STATE.update({"phase": "crawling", "total": len(folders)})
-    t0 = time.time()
-    done = skipped = 0
-    counts = {"ok": 0, "empty": 0, "no_txt": 0, "missing": 0, "error": 0}
+        CRAWL_STATE.update({"phase": "crawling", "total": len(folders)})
+        t0 = time.time()
+        done = skipped = 0
+        counts = {"ok": 0, "empty": 0, "no_txt": 0, "missing": 0, "error": 0}
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(
-                crawl_set, num, href, base,
-                prev_by_num.get(num), delay, force,
-            ): num
-            for num, href in folders
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    crawl_set, num, href, base,
+                    prev_by_num.get(num), delay, force,
+                ): num
+                for num, href in folders
+            }
+            for fut in as_completed(futures):
+                num = futures[fut]
+                try:
+                    res = fut.result()
+                except Exception as e:  # defensive: workers should not raise
+                    log(f"  ! set {num:03d}: unexpected error {e}", flush=True)
+                    counts["error"] += 1
+                    continue
+                if res.get("skip"):
+                    skipped += 1
+                else:
+                    save_set(con, res)
+                    counts[res["status"]] = counts.get(res["status"], 0) + 1
+                done += 1
+                CRAWL_STATE.update({
+                    "done": done, "fetched": done - skipped, "unchanged": skipped,
+                    "counts": dict(counts),
+                })
+                if done % 25 == 0 or done == len(folders):
+                    log(
+                        f"  {done}/{len(folders)} folders "
+                        f"({done - skipped} fetched, {skipped} unchanged)",
+                        flush=True,
+                    )
+
+        CRAWL_STATE["phase"] = "finalizing"
+        log("Rebuilding full-text index...", flush=True)
+        with con:
+            rebuild_fts(con)
+        con.execute("PRAGMA optimize")
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+        n_sets = con.execute("SELECT COUNT(*) FROM sets").fetchone()[0]
+        n_tracks = con.execute("SELECT COUNT(*) FROM tracks").fetchone()[0]
+        summary = {
+            "sets": n_sets, "tracks": n_tracks, "seconds": round(time.time() - t0, 1),
+            "counts": counts, "unchanged": skipped,
         }
-        for fut in as_completed(futures):
-            num = futures[fut]
-            try:
-                res = fut.result()
-            except Exception as e:  # defensive: workers should not raise
-                log(f"  ! set {num:03d}: unexpected error {e}", flush=True)
-                counts["error"] += 1
-                continue
-            if res.get("skip"):
-                skipped += 1
-            else:
-                save_set(con, res)
-                counts[res["status"]] = counts.get(res["status"], 0) + 1
-            done += 1
-            CRAWL_STATE.update({
-                "done": done, "fetched": done - skipped, "unchanged": skipped,
-                "counts": dict(counts),
-            })
-            if done % 25 == 0 or done == len(folders):
-                log(
-                    f"  {done}/{len(folders)} folders "
-                    f"({done - skipped} fetched, {skipped} unchanged)",
-                    flush=True,
-                )
-
-    CRAWL_STATE["phase"] = "finalizing"
-    log("Rebuilding full-text index...", flush=True)
-    with con:
-        rebuild_fts(con)
-    con.execute("PRAGMA optimize")
-    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-
-    n_sets = con.execute("SELECT COUNT(*) FROM sets").fetchone()[0]
-    n_tracks = con.execute("SELECT COUNT(*) FROM tracks").fetchone()[0]
-    summary = {
-        "sets": n_sets, "tracks": n_tracks, "seconds": round(time.time() - t0, 1),
-        "counts": counts, "unchanged": skipped,
-    }
-    log(
-        f"Done in {summary['seconds']:.0f}s: {n_sets} sets, {n_tracks} tracks indexed "
-        f"(this run: {counts['ok']} ok, {counts['no_txt']} without tracklist, "
-        f"{counts['missing']} missing, {counts['error']} errors, {skipped} unchanged)",
-        flush=True,
-    )
-    return summary
+        log(
+            f"Done in {summary['seconds']:.0f}s: {n_sets} sets, {n_tracks} tracks indexed "
+            f"(this run: {counts['ok']} ok, {counts['no_txt']} without tracklist, "
+            f"{counts['missing']} missing, {counts['error']} errors, {skipped} unchanged)",
+            flush=True,
+        )
+        _save_crawl_meta(con, started, _now(), summary)
+        return summary
+    except Exception as e:
+        try:
+            _save_crawl_meta(con, started, _now(), {"error": str(e)[:200]})
+        except Exception:
+            pass
+        raise
 
 
 def cmd_crawl(args):
@@ -836,8 +863,20 @@ class Handler(BaseHTTPRequestHandler):
                 "SELECT COUNT(*) AS n, MAX(crawled_at) AS crawled FROM sets"
             ).fetchone()
             two = self.db.execute("SELECT COUNT(*) AS n FROM tracks").fetchone()
+            meta = {}
+            try:
+                meta = {r["key"]: r["value"] for r in self.db.execute("SELECT key, value FROM meta")}
+            except sqlite3.OperationalError:
+                pass
+            last_crawl = None
+            try:
+                last_crawl = json.loads(meta["last_crawl_summary"]) if meta.get("last_crawl_summary") else None
+            except (ValueError, KeyError):
+                pass
             self.send_json({
                 "sets": one["n"], "tracks": two["n"], "crawled_at": one["crawled"],
+                "last_checked": meta.get("last_crawl_finished"),
+                "last_crawl": last_crawl,
                 "db": str(self.db_path),
             })
         else:
@@ -852,6 +891,7 @@ def cmd_serve(args):
     VERBOSE = args.verbose
     Handler.db = connect_db(db_path)
     Handler.db_path = db_path
+    create_schema(Handler.db)  # idempotent; also upgrades indexes made by older versions
     try:
         httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     except OSError as e:
@@ -876,11 +916,17 @@ def cmd_stats(args):
     n_tracks = con.execute("SELECT COUNT(*) FROM tracks").fetchone()[0]
     crawled = con.execute("SELECT MAX(crawled_at) FROM sets").fetchone()[0]
     artists = con.execute("SELECT COUNT(DISTINCT artist) FROM tracks WHERE artist != ''").fetchone()[0]
+    try:
+        meta = {r["key"]: r["value"] for r in con.execute("SELECT key, value FROM meta")}
+    except sqlite3.OperationalError:
+        meta = {}
     print(f"db       : {db_path}")
     print(f"sets     : {n_sets}")
     print(f"tracks   : {n_tracks}")
     print(f"artists  : {artists}")
-    print(f"crawled  : {crawled}")
+    print(f"indexed  : {crawled} (last data change)")
+    if meta.get("last_crawl_finished"):
+        print(f"checked  : {meta['last_crawl_finished']} (last crawl run)")
 
 
 # --------------------------------------------------------------------------- #

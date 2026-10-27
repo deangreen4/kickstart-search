@@ -325,11 +325,30 @@ $("#close").addEventListener("click", () => {
 
 /* ---------- re-crawl with progress ---------- */
 
+function fmtWhen(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (isNaN(d)) return null;
+  return d.toDateString() === new Date().toDateString()
+    ? d.toLocaleTimeString()
+    : d.toLocaleString();
+}
+
 function refreshStats() {
   return fetch("/api/stats").then(r => r.json()).then(s => {
-    const d = s.crawled_at ? new Date(s.crawled_at).toLocaleString() : "never";
+    const bits = [`${s.sets} sets`, `${s.tracks.toLocaleString()} tracks`];
+    const indexed = fmtWhen(s.crawled_at), checked = fmtWhen(s.last_checked);
+    if (indexed && checked && indexed !== checked) {
+      bits.push(`indexed ${indexed}`, `checked ${checked}`);
+    } else if (indexed) {
+      bits.push(`indexed ${indexed}`);
+    } else if (checked) {
+      bits.push(`checked ${checked}`);
+    } else {
+      bits.push("index empty");
+    }
     $("#stats").innerHTML =
-      `${s.sets} sets &middot; ${s.tracks.toLocaleString()} tracks &middot; indexed ${esc(d)}` +
+      bits.join(" &middot; ") +
       ` &middot; <a href="#" id="recrawl" title="re-index the archive in the background">re-crawl to update</a>`;
   }).catch(() => {});
 }
