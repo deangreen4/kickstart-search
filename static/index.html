@@ -14,7 +14,7 @@
   body {
     background: var(--bg); color: var(--text);
     font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    padding-bottom: 90px;
+    padding-bottom: 150px;
   }
   header { padding: 22px 20px 6px; max-width: 960px; margin: 0 auto; }
   h1 { margin: 0; font-size: 22px; letter-spacing: .3px; }
@@ -79,6 +79,16 @@
   .now { flex: 1; min-width: 0; }
   #nowtitle { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13.5px; }
   .now small { color: var(--dim); }
+	.timeline { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+	.timeline time { font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+	#seek { flex: 1; min-width: 0; margin: 0; accent-color: var(--accent); cursor: pointer; }
+	#seek:disabled { cursor: default; opacity: .45; }
+	@media (max-width: 520px) {
+		.player { flex-wrap: wrap; gap: 8px; }
+		.now { flex-basis: calc(100% - 54px); }
+		#nowlink { margin-left: 46px; }
+		#close { margin-left: auto; }
+	}
   #nowlink { color: var(--accent); text-decoration: none; font-size: 13px; white-space: nowrap; }
   #nowlink:hover { text-decoration: underline; }
   #close { border: none; background: none; color: var(--dim); font-size: 15px; }
@@ -109,6 +119,12 @@
   <div class="now">
     <span id="nowtitle"></span>
     <small id="nowsub"></small>
+		<div class="timeline">
+			<time id="elapsed">0:00:00</time>
+			<input id="seek" type="range" min="0" max="0" value="0" step="1" disabled
+				aria-label="Playback position" aria-valuetext="0:00:00" title="Seek through audio">
+			<time id="duration">--:--:--</time>
+		</div>
   </div>
   <a id="nowlink" target="_blank" rel="noopener">open mp3 &#8599;</a>
   <button id="close" title="close player">&#10005;</button>
@@ -299,13 +315,53 @@ resultsEl.addEventListener("click", async ev => {
 
 /* ---------- player ---------- */
 
+const seekEl = $("#seek");
+let scrubbing = false;
+
+function formatTime(seconds) {
+	const total = Math.max(0, Math.floor(Number.isFinite(seconds) ? seconds : 0));
+	return `${Math.floor(total / 3600)}:${pad(Math.floor(total / 60) % 60)}:${pad(total % 60)}`;
+}
+
+function showPosition(seconds) {
+	$("#elapsed").textContent = formatTime(seconds);
+	seekEl.setAttribute("aria-valuetext", `${formatTime(seconds)} of ${formatTime(audio.duration)}`);
+}
+
+function updateTimeline() {
+	const duration = audio.duration;
+	const ready = Number.isFinite(duration) && duration > 0;
+	seekEl.disabled = !ready;
+	seekEl.max = ready ? duration : 0;
+	$("#duration").textContent = ready ? formatTime(duration) : "--:--:--";
+	if (!scrubbing) {
+		seekEl.value = ready ? Math.min(audio.currentTime || 0, duration) : 0;
+		showPosition(audio.currentTime || 0);
+	}
+}
+
+seekEl.addEventListener("input", () => {
+	scrubbing = true;
+	showPosition(Number(seekEl.value));
+});
+seekEl.addEventListener("change", () => {
+	if (!seekEl.disabled) audio.currentTime = Number(seekEl.value);
+	scrubbing = false;
+	updateTimeline();
+});
+for (const event of ["loadedmetadata", "durationchange", "timeupdate", "seeked", "emptied", "ended"]) {
+	audio.addEventListener(event, updateTimeline);
+}
+
 function playSet(num, url, title, count) {
   if (current && current.num === num && audio.src) {
     if (audio.paused) audio.play(); else audio.pause();
     return;
   }
   current = { num, url, title };
+	scrubbing = false;
   audio.src = url;
+	updateTimeline();
   audio.play();
   playerEl.classList.remove("hidden");
   $("#nowtitle").textContent = title;
@@ -319,7 +375,9 @@ $("#pp").addEventListener("click", () => {
 audio.addEventListener("play", () => ($("#pp").innerHTML = "&#10074;&#10074;"));
 audio.addEventListener("pause", () => ($("#pp").innerHTML = "&#9654;"));
 $("#close").addEventListener("click", () => {
+	scrubbing = false;
   audio.pause(); audio.removeAttribute("src"); audio.load();
+	updateTimeline();
   playerEl.classList.add("hidden"); current = null;
 });
 
